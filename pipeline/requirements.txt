@@ -1,0 +1,4 @@
+Pillow>=10.1
+satpy==0.60.0
+pyspectral==0.14.3
+pyorbital==1.14.0
