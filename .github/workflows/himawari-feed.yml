@@ -1,28 +1,39 @@
-# 10分ごとに気象庁のひまわり画像を取得し、GitHub Pages に配信する。
-# リポジトリの Settings > Pages > Source を「GitHub Actions」にしておくこと。
+# 10分ごとに、ひまわりの最新観測（高解像度）と過去24時間の履歴を GitHub Pages に配信する。
+# Settings > Pages > Source は「GitHub Actions」。
+# GitHub の定期実行(schedule)は新しいリポジトリだと動き出さないことがあるため、
+# 実行の最後に「次の回」を自分で予約する（relay）。止めたいときは
+# Settings > Secrets and variables > Actions > Variables に HIMAWARI_RELAY = off を作る。
 name: himawari-feed
 on:
   schedule:
-    - cron: "4,14,24,34,44,54 * * * *"   # 観測(00,10,…分)から約12分後に配信されるため、4分ずらす（実際の起動は数分〜十数分遅れることがある）
+    - cron: "4,14,24,34,44,54 * * * *"
   workflow_dispatch:
 permissions:
   contents: read
   pages: write
   id-token: write
+  actions: write
 concurrency:
   group: pages
   cancel-in-progress: false
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install "Pillow>=10.1"
-      - run: python pipeline/himawari_fetch.py --out site
+          cache: pip
+          cache-dependency-path: pipeline/requirements.txt
+      - uses: actions/cache@v4
+        with:
+          path: ~/.local/share/pyspectral
+          key: pyspectral-0.14.3
+      - run: pip install -r pipeline/requirements.txt
+      - run: python -c "from pyspectral.utils import download_luts, download_rsr; download_rsr(); download_luts(aerosol_types=['rayleigh_only'])"
+      - run: python pipeline/feed.py --out site --site-url "https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/"
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site
@@ -35,3 +46,23 @@ jobs:
     steps:
       - id: deployment
         uses: actions/deploy-pages@v4
+  relay:
+    needs: deploy
+    if: always() && vars.HIMAWARI_RELAY != 'off'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          # 次の xx:04, xx:14, … まで待つ（観測から約14分後にデータがそろうため）
+          now=$(date -u +%s); m=$(( (now / 60) % 10 )); s=$(( now % 60 ))
+          wait=$(( ((14 - m) % 10) * 60 - s )); if [ $wait -lt 60 ]; then wait=$(( wait + 600 )); fi
+          echo "wait ${wait}s"; sleep $wait
+          # ほかに待機中・実行中の回があれば予約しない（二重の鎖を作らない）
+          others=$(gh run list -R "$REPO" --workflow himawari-feed.yml --limit 20 --json status,databaseId \
+            --jq "[.[] | select(.status != \"completed\" and .databaseId != $RUN_ID)] | length")
+          echo "others=$others"
+          if [ "$others" = "0" ]; then gh workflow run himawari-feed.yml -R "$REPO" --ref main; fi
