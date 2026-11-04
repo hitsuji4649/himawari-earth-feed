@@ -1,0 +1,37 @@
+# 10分ごとに気象庁のひまわり画像を取得し、GitHub Pages に配信する。
+# リポジトリの Settings > Pages > Source を「GitHub Actions」にしておくこと。
+name: himawari-feed
+on:
+  schedule:
+    - cron: "4-59/10 * * * *"   # 観測(00,10,…分)から約12分後に配信されるため、4分ずらす（実際の起動は数分〜十数分遅れることがある）
+  workflow_dispatch:
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: pages
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install "Pillow>=10.1"
+      - run: python pipeline/himawari_fetch.py --out site
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
