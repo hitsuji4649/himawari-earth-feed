@@ -139,8 +139,12 @@ BM_FILES = {"global": "BlackMarble_2016_3km_gray.jpg",       # 13500x6750, 経�
 BM_DIR = Path(os.environ.get("HIMAWARI_BM_DIR", Path.home() / ".cache" / "himawari_bm"))
 NIGHT_MOON_GAIN = 0.32       # 満月が真上のときの雲の明るさ（表示値。実際より強調）
 NIGHT_BASE = 0.012           # 月がなくても星明かりでごくわずかに
-LIGHTS_GAIN = 1.0
-LIGHTS_COLOR = (1.0, 0.76, 0.42)
+LIGHTS_GAIN = 0.75           # 都市の中心の明るさ（表示値）
+LIGHTS_FLOOR = 30.0          # 地図の値でこれ以下は暗い地面とみなす
+LIGHTS_GAMMA = 2.2           # 大きいほど郊外の薄い光が沈み、芯だけが光る
+LIGHTS_HALO_CUT = 0.55       # 元の地図に含まれる光のにじみを差し引く割合
+LIGHTS_DIM = (1.0, 0.62, 0.30)    # 暗めの明かり（ナトリウム灯寄りのオレンジ）
+LIGHTS_CORE = (1.0, 0.88, 0.70)   # 明るい中心部（LED寄りの白）
 MOON_COLOR = (0.78, 0.84, 0.95)
 
 
@@ -156,16 +160,20 @@ def bm_path(key):
 
 
 class Lights:
-    """街明かり 0..1。日本付近（90°E〜180°）は 500m、ほかは 3km の地図から。地図は一度だけ読む。"""
-    def __init__(self, need_d1, need_d2):
+    """街明かりの地図（0..255）。res_km に合わせて地図を選ぶ: 2km以上=3km全球、1km=500m地図を1kmに縮小、0.5km=500m。
+    日本付近（90°E〜180°）以外は 3km 全球のみ。地図は一度だけ読む。"""
+    def __init__(self, res_km):
         import numpy as np
         Image.MAX_IMAGE_PIXELS = None
         self.g = np.asarray(Image.open(bm_path("global")).convert("L"))
         self.t = {}
-        for key, need in (("D1", need_d1), ("D2", need_d2)):
-            if need:
+        if res_km < 2:
+            for key in ("D1", "D2"):
                 try:
-                    self.t[key] = np.asarray(Image.open(bm_path(key)).convert("L"))
+                    im = Image.open(bm_path(key)).convert("L")
+                    if res_km >= 1:
+                        im = im.reduce(2)                     # 1km 格子用に平均して縮小（ちらつき防止）
+                    self.t[key] = np.asarray(im)
                 except Exception as e:
                     log("街明かり 500m 地図を使えません（3kmで代用）:", key, e)
 
@@ -188,8 +196,7 @@ class Lights:
             xi = np.clip(((lon[m] - 90) / 90 * n).astype(np.int32), 0, n - 1)
             yi = np.clip(((la0 - lat[m]) / 90 * n).astype(np.int32), 0, n - 1)
             out[m] = t[yi, xi]
-        v = np.clip((out - 22.0) / 233.0, 0, 1)        # 地図の地の明るさを落とす
-        return v ** 1.4
+        return out
 
 
 def moon_state(t):
@@ -248,22 +255,30 @@ def cloud_from_bt(bt, lat, cell):
     return np.nan_to_num(c).astype(np.float32)
 
 
-def add_night(arr, bt, area, t_obs, cell, rows=400):
-    """arr: 表示用RGB (H,W,3) 0..1。夜側に雲（月明かり相当）と街明かりを足して返す（メモリ節約のため行ごとに処理）。"""
+def add_night(arr, bt, area, t_obs, cell, res_km, rows=400):
+    """arr: 表示用RGB (H,W,3) 0..1。夜側に雲（月明かり相当）と街明かりを足して返す。
+    bt は res_km の格子に「そのまま拡大」された赤外（2km）。四角いむらが出ないよう、なめらかにしてから使う。"""
     import numpy as np
+    from scipy import ndimage
     from pyorbital.astronomy import sun_zenith_angle
     t0 = time.time()
     arr = np.asarray(arr, np.float32)
     tmid = t_obs + timedelta(minutes=5)
     H, W = bt.shape
-    # 雲の推定に使う緯度（粗くてよい）
+    up = max(1.0, 2.0 / res_km)                    # 赤外の1画素がこの格子の何画素か
+    if up > 1:
+        b = np.where(np.isfinite(bt), bt, np.nanmean(bt))
+        bt = ndimage.gaussian_filter(b, sigma=0.6 * up).astype(np.float32)
     lat_c = np.asarray(area.get_lonlats(dtype=np.float32, data_slice=(slice(None), slice(W // 2, W // 2 + 1)))[1])
     lat_c = np.where(np.abs(lat_c) > 1e3, np.nan, lat_c).reshape(H, 1)     # 行ごとのおおよその緯度
     cloud = cloud_from_bt(bt, lat_c, cell)
     ra, dec, illum = moon_state(tmid)
     g0 = gmst_rad(tmid)
+    # 1) 夜の重み・月の高さ・街明かりの地図を、行ごとに求める
+    night = np.zeros((H, W), np.float32)
+    moon = np.zeros((H, W), np.float32)
+    lmap = np.zeros((H, W), np.float32)
     lights = None
-    any_night = False
     for r0 in range(0, H, rows):
         r1 = min(H, r0 + rows)
         lon, lat = area.get_lonlats(dtype=np.float32, data_slice=(slice(r0, r1), slice(None)))
@@ -273,22 +288,37 @@ def add_night(arr, bt, area, t_obs, cell, rows=400):
         if not okk.any():
             continue
         sza = sun_zenith_angle(tmid.replace(tzinfo=None), np.nan_to_num(lon), np.nan_to_num(lat))
-        night = np.clip((sza - 90.0) / 8.0, 0, 1).astype(np.float32)
-        night[~okk] = 0
-        if night.max() <= 0:
+        nw = np.clip((sza - 90.0) / 8.0, 0, 1).astype(np.float32)
+        nw[~okk] = 0
+        night[r0:r1] = nw
+        if nw.max() <= 0:
             continue
-        any_night = True
         if lights is None:
-            lights = Lights(need_d1=True, need_d2=True)
+            lights = Lights(res_km)
         Hh = g0 + np.radians(np.nan_to_num(lon)) - ra
         la = np.radians(np.nan_to_num(lat))
         sin_alt = (np.sin(la) * np.sin(dec) + np.cos(la) * np.cos(dec) * np.cos(Hh)).astype(np.float32)
-        moon = NIGHT_MOON_GAIN * illum * np.clip(sin_alt, 0, 1) ** 0.7 + NIGHT_BASE
-        c = cloud[r0:r1]
-        li = lights.at(lon, lat) * (1 - 0.9 * c) * LIGHTS_GAIN
-        add = (c * moon)[..., None] * np.array(MOON_COLOR, np.float32) + li[..., None] * np.array(LIGHTS_COLOR, np.float32)
-        arr[r0:r1] = np.clip(arr[r0:r1] + night[..., None] * add, 0, 1)
-    log(f"夜側 合成 {time.time() - t0:.0f}s 夜あり={any_night} 月の照らされた割合 {illum:.2f}")
+        moon[r0:r1] = NIGHT_MOON_GAIN * illum * np.clip(sin_alt, 0, 1) ** 0.7 + NIGHT_BASE
+        lmap[r0:r1] = lights.at(lon, lat)
+    if night.max() <= 0:
+        log("夜側なし")
+        return arr
+    del lights
+    # 2) 街明かり: 地図のにじみを差し引き、暗い部分を沈めて芯を残す（約1.5kmのぼかしとの差）
+    halo = ndimage.gaussian_filter(lmap, sigma=max(1.0, 1.5 / res_km))
+    sharp = np.clip((lmap - LIGHTS_HALO_CUT * halo) / (1 - LIGHTS_HALO_CUT), 0, 255)
+    v = np.clip((sharp - LIGHTS_FLOOR) / (255.0 - LIGHTS_FLOOR), 0, 1)
+    li = LIGHTS_GAIN * v ** LIGHTS_GAMMA
+    # 雲の下の街: 光がぼやけて広がる（薄く大きくにじむ）
+    glow = ndimage.gaussian_filter(li, sigma=max(1.0, 4.0 / res_km)) * 0.45
+    li = li * (1 - cloud) + glow * cloud * (1 - 0.6 * cloud)
+    del lmap, halo, sharp, glow
+    # 3) 色: 明るい中心ほど白（LED）、暗いほどオレンジ（ナトリウム灯）
+    k = np.clip((v - 0.25) / 0.6, 0, 1)[..., None]
+    col = np.array(LIGHTS_DIM, np.float32) * (1 - k) + np.array(LIGHTS_CORE, np.float32) * k
+    add = (cloud * moon)[..., None] * np.array(MOON_COLOR, np.float32) + li[..., None] * col
+    arr = np.clip(arr + night[..., None] * add, 0, 1)
+    log(f"夜側 合成 {time.time() - t0:.0f}s 月の照らされた割合 {illum:.2f}")
     return arr
 
 
@@ -314,7 +344,7 @@ def hsd_rgb(files):
         area, st = lr[comp].attrs["area"], lr[comp].attrs["start_time"].replace(tzinfo=timezone.utc)
         del lr, scn
         import gc; gc.collect()
-        arr = add_night(arr, bt, area, st, 50)
+        arr = add_night(arr, bt, area, st, 50, 2.0)
     except Exception as e:
         log("夜側の合成に失敗（夜側は観測のまま）:", e)
     log(f"合成 {time.time() - t0:.0f}s")
@@ -350,7 +380,7 @@ def hsd_region(files, box, finest, size):
     arr = np.clip(np.nan_to_num(arr), 0, 1).transpose(1, 2, 0)
     try:
         km = 0.5 if finest else 1.0
-        arr = add_night(arr, np.asarray(lr["B13"].values, np.float32), data.attrs["area"], data.attrs["start_time"].replace(tzinfo=timezone.utc), int(100 / km))
+        arr = add_night(arr, np.asarray(lr["B13"].values, np.float32), data.attrs["area"], data.attrs["start_time"].replace(tzinfo=timezone.utc), int(100 / km), km)
     except Exception as e:
         log("夜側の合成に失敗（夜側は観測のまま）:", e)
     img = Image.fromarray((arr * 255 + 0.5).astype("uint8"))
