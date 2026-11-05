@@ -5,11 +5,12 @@
    NOAA が公開しているひまわり9号の標準データ(HSD)から、Satpy のトゥルーカラー再現で
    4032px の画像を作り、継ぎ目用の重なり付き 2048px×4枚に分けて hi/HHMM_0..3.jpg に置く。
    真下まわり（低い高度で見える範囲）は 1km 格子で別に作り、dt/HHMM_0..3.jpg に置く。
+   日本まわり（ISS高度モード用）は 0.5km 格子（B03で鮮鋭化）で別に作り、jp/HHMM_0..3.jpg に置く。
 2) 過去24時間の履歴（時間の前後用）:
    気象庁Webのフルディスク・トゥルーカラー画像(601px)を 1024px に整えて hist/HHMM.jpg に置く。
    前回の配信分を自分の Pages から引き継ぎ、足りない分だけ気象庁から取る。
 3) latest.txt（Udon が読む）:
-   1行目 HIMAWARI2|高解像度の観測UTC|スロット|処理UTC|D(真下まわりの詳細あり) または -
+   1行目 HIMAWARI2|高解像度の観測UTC|スロット|処理UTC|印（D=真下まわりの詳細あり, J=日本まわりあり, 無ければ -）
    2行目 履歴の観測時刻(YYYYMMDDHHMM)を新しい順にカンマ区切り
 
 観測時刻は常に「観測開始の公称時刻」。日付は推測せず、ファイルの更新時刻やデータ名から確定する。
@@ -45,6 +46,9 @@ LO = 1024
 PAD = 16            # タイルの継ぎ目対策の重なり幅
 # 真下まわりの詳細（1km格子）: 走査角で ±DETAIL_FRAC×(地球の縁) の正方形。高度400kmで見える範囲をおおう
 DETAIL_FRAC = 0.40
+DETAIL_BOX = (-DETAIL_FRAC, -DETAIL_FRAC, DETAIL_FRAC, DETAIL_FRAC)   # 地球の縁の走査角を1とした (x0, y0, x1, y1)
+# 日本まわり（0.5km格子）: 走査角[rad]の長方形 (x0, y0, x1, y1)。与那国島〜宗谷岬・知床をおおう
+JAPAN_BOX = (-0.050, 0.066, 0.012, 0.122)
 
 # ---- 気象庁Web画像(601px, 東経140.0°中心) ----
 JMA = "https://www.data.jma.go.jp/mscweb/data/himawari/img/fd_/fd__trm_{hhmm}.jpg"
@@ -59,6 +63,7 @@ S3 = "https://noaa-himawari9.s3.amazonaws.com"
 HSD_BANDS = ("B01", "B02", "B03", "B04", "B13")
 HSD_CX = HSD_CY = 2750.0
 HSD_R = 2717.08                                  # 赤道の縁までの画素数（area_extent から計算）
+HSD_PIX = 0.15185208 / HSD_R                     # 2km格子1画素の走査角[rad]
 
 
 def log(*a):
@@ -229,26 +234,56 @@ def hsd_rgb(files):
     return Image.fromarray((arr * 255 + 0.5).astype("uint8"))
 
 
-def hsd_detail(files):
-    """真下まわりを 1km 格子で合成する（低い高度用）。"""
+def hsd_region(files, box, finest, size):
+    """走査角の長方形 box=(x0,y0,x1,y1)[rad] を size 四方の画像にする。
+    finest=True なら 0.5km 格子（B03 で鮮鋭化）、False なら 1km 格子で合成する。
+    切り出しは格子に合わせて丸められるので、最後に area の座標から正確に切り直す。"""
     t0 = time.time()
     import dask
     import numpy as np
     from satpy import Scene
     from satpy.writers import get_enhanced_image
-    dask.config.set(num_workers=4)
+    dask.config.set(num_workers=2)
+    # 必要な帯（10分割のセグメント）のファイルだけ読む（全球を高解像度で読むとメモリが足りない）
+    ext = 2750 * HSD_PIX
+    segs = {min(10, max(1, int((ext - y) / (2 * ext) * 10) + 1)) for y in (box[1] - 0.004, box[3] + 0.004)}
+    segs = set(range(min(segs), max(segs) + 1))
+    files = [f for f in files if int(re.search(r"_S(\d\d)10", f).group(1)) in segs]
     scn = Scene(reader="ahi_hsd", filenames=files)
     comp = "true_color_reproduction"
     scn.load([comp], generate=False)
-    a1 = scn["B01"].attrs["area"]
-    h = a1.crs.to_dict().get("h", 35785863.0)
-    half = DETAIL_FRAC * np.arcsin(6378137.0 / 42164160.0) * h
-    scn2 = scn.crop(xy_bbox=(-half, -half, half, half))
-    lr = scn2.resample(scn2["B01"].attrs["area"], resampler="native")
-    arr = np.asarray(get_enhanced_image(lr[comp]).data.values)[:3]
+    h = scn["B01"].attrs["area"].crs.to_dict().get("h", 35785863.0)
+    x0, y0, x1, y1 = [v * h for v in box]
+    m = 0.02 * max(x1 - x0, y1 - y0)
+    scn2 = scn.crop(xy_bbox=(x0 - m, y0 - m, x1 + m, y1 + m))
+    area = scn2.finest_area() if finest else scn2["B01"].attrs["area"]
+    lr = scn2.resample(area, resampler="native")
+    data = lr[comp]
+    arr = np.asarray(get_enhanced_image(data).data.values)[:3]
     arr = np.clip(np.nan_to_num(arr), 0, 1).transpose(1, 2, 0)
-    log(f"詳細合成 {arr.shape} {time.time() - t0:.0f}s")
-    return Image.fromarray((arr * 255 + 0.5).astype("uint8"))
+    img = Image.fromarray((arr * 255 + 0.5).astype("uint8"))
+    ar = data.attrs["area"]
+    xl, yl, xu, yu = ar.area_extent
+    W, H = ar.width, ar.height
+    dx, dy = (xu - xl) / W, (yu - yl) / H
+    if not (xl <= x0 and x1 <= xu and yl <= y0 and y1 <= yu):
+        raise ValueError(f"切り出し範囲が足りない {ar.area_extent} {(x0, y0, x1, y1)}")
+    out = img.transform((size, size), Image.AFFINE,
+                        ((x1 - x0) / size / dx, 0, (x0 - xl) / dx, 0, (y1 - y0) / size / dy, (yu - y1) / dy),
+                        resample=Image.BICUBIC)
+    log(f"部分合成 {'0.5km' if finest else '1km'} {img.size} -> {size} {time.time() - t0:.0f}s")
+    return out
+
+
+def hsd_detail(files):
+    """真下まわりを 1km 格子で（低い高度用）。"""
+    e = float(__import__("numpy").arcsin(6378137.0 / 42164160.0))
+    return hsd_region(files, tuple(v * e for v in DETAIL_BOX), False, HI)
+
+
+def hsd_japan(files):
+    """日本まわりを 0.5km 格子で（ISS高度モード用）。"""
+    return hsd_region(files, JAPAN_BOX, True, HI)
 
 
 def save_tiles(canvas, folder, stem):
@@ -266,9 +301,9 @@ def write_hi(out, obs, rgb):
     save_tiles(canvas, out / "hi", f"{obs:%H%M}")
 
 
-def write_detail(out, obs, img):
-    (out / "dt").mkdir(parents=True, exist_ok=True)
-    save_tiles(img.resize((HI, HI), Image.LANCZOS), out / "dt", f"{obs:%H%M}")
+def write_layer(out, folder, obs, img):
+    (out / folder).mkdir(parents=True, exist_ok=True)
+    save_tiles(img, out / folder, f"{obs:%H%M}")
 
 
 def carry_tiles(out, site_url, folder, slot):
@@ -278,15 +313,21 @@ def carry_tiles(out, site_url, folder, slot):
         (out / folder / f"{slot}_{i}.jpg").write_bytes(raw)
 
 
-def carry_hi(out, site_url, slot, with_detail):
+LAYERS = (("D", "dt", hsd_detail, "詳細"), ("J", "jp", hsd_japan, "日本"))
+
+
+def carry_hi(out, site_url, slot, flags):
+    """前回分を引き継ぐ。引き継げた印を返す。"""
     carry_tiles(out, site_url, "hi", slot)
-    if with_detail:
-        try:
-            carry_tiles(out, site_url, "dt", slot)
-            return True
-        except Exception as e:
-            log("詳細の引き継ぎ失敗", e)
-    return False
+    got = ""
+    for f, folder, _, name in LAYERS:
+        if f in flags:
+            try:
+                carry_tiles(out, site_url, folder, slot)
+                got += f
+            except Exception as e:
+                log(f"{name}の引き継ぎ失敗", e)
+    return got
 
 
 INDEX = """<!doctype html><meta charset="utf-8"><title>Himawari Earth feed</title>
@@ -320,8 +361,8 @@ def main():
 
     hi_obs = None
     prev_hi = None
-    has_detail = False
-    prev_detail = bool(prev_head and len(prev_head) >= 5 and prev_head[4] == "D")
+    flags = ""
+    prev_flags = prev_head[4] if prev_head and len(prev_head) >= 5 else ""
     if prev_head and len(prev_head) >= 3 and prev_head[0] == "HIMAWARI2" and prev_head[1] != "-":
         prev_hi = datetime.strptime(prev_head[1], "%Y-%m-%dT%H:%MZ").replace(tzinfo=timezone.utc)
     if not args.no_hires:
@@ -329,7 +370,7 @@ def main():
         if t is not None and t == prev_hi:
             log("高解像度: 新しい観測なし。前回分を引き継ぎ")
             try:
-                has_detail = carry_hi(out, site, t.strftime("%H%M"), prev_detail)
+                flags = carry_hi(out, site, t.strftime("%H%M"), prev_flags)
                 hi_obs = t
             except Exception as e:
                 log("引き継ぎ失敗", e)
@@ -339,23 +380,24 @@ def main():
                     files = hsd_download(keys, wd)
                     write_hi(out, t, hsd_rgb(files))
                     hi_obs = t
-                    try:
-                        write_detail(out, t, hsd_detail(files))
-                        has_detail = True
-                    except Exception as e:
-                        log("詳細の作成に失敗（全体画像だけ配信）:", e)
+                    for f, folder, make, name in LAYERS:
+                        try:
+                            write_layer(out, folder, t, make(files))
+                            flags += f
+                        except Exception as e:
+                            log(f"{name}の作成に失敗（その層なしで配信）:", e)
                 except Exception as e:
                     log("高解像度の作成に失敗:", e)
         if hi_obs is None and prev_hi is not None and now - prev_hi < timedelta(hours=3):
             try:
-                has_detail = carry_hi(out, site, prev_hi.strftime("%H%M"), prev_detail)
+                flags = carry_hi(out, site, prev_hi.strftime("%H%M"), prev_flags)
                 hi_obs = prev_hi
             except Exception as e:
                 log("引き継ぎ失敗", e)
         # 直前の高解像度も1組残す（配信情報のキャッシュずれ対策）
         if hi_obs is not None and prev_hi is not None and prev_hi != hi_obs and now - prev_hi < timedelta(hours=3):
             try:
-                carry_hi(out, site, prev_hi.strftime("%H%M"), prev_detail)
+                carry_hi(out, site, prev_hi.strftime("%H%M"), prev_flags)
             except Exception:
                 pass
 
@@ -366,7 +408,7 @@ def main():
     hi_s = f"{hi_obs:%Y-%m-%dT%H:%MZ}" if hi_obs else "-"
     slot_s = f"{hi_obs:%H%M}" if hi_obs else "-"
     (out / "latest.txt").write_text(
-        f"HIMAWARI2|{hi_s}|{slot_s}|{processed:%Y-%m-%dT%H:%M:%SZ}|{'D' if has_detail else '-'}\n"
+        f"HIMAWARI2|{hi_s}|{slot_s}|{processed:%Y-%m-%dT%H:%M:%SZ}|{flags or '-'}\n"
         + ",".join(f"{o:%Y%m%d%H%M}" for o in hist) + "\n", encoding="utf-8")
     (out / "index.html").write_text(INDEX.format(
         hi=(f"{hi_obs:%Y-%m-%d %H:%M} UTC" if hi_obs else "なし"), n=len(hist),
