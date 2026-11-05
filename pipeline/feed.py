@@ -3,12 +3,13 @@
 
 1) 最新の高解像度画像:
    NOAA が公開しているひまわり9号の標準データ(HSD)から、Satpy のトゥルーカラー再現で
-   4096px の画像を作り、2048px×4枚に分けて hi/HHMM_0..3.jpg に置く。
+   4032px の画像を作り、継ぎ目用の重なり付き 2048px×4枚に分けて hi/HHMM_0..3.jpg に置く。
+   真下まわり（低い高度で見える範囲）は 1km 格子で別に作り、dt/HHMM_0..3.jpg に置く。
 2) 過去24時間の履歴（時間の前後用）:
    気象庁Webのフルディスク・トゥルーカラー画像(601px)を 1024px に整えて hist/HHMM.jpg に置く。
    前回の配信分を自分の Pages から引き継ぎ、足りない分だけ気象庁から取る。
 3) latest.txt（Udon が読む）:
-   1行目 HIMAWARI2|高解像度の観測UTC|スロット|処理UTC
+   1行目 HIMAWARI2|高解像度の観測UTC|スロット|処理UTC|D(真下まわりの詳細あり) または -
    2行目 履歴の観測時刻(YYYYMMDDHHMM)を新しい順にカンマ区切り
 
 観測時刻は常に「観測開始の公称時刻」。日付は推測せず、ファイルの更新時刻やデータ名から確定する。
@@ -39,8 +40,11 @@ UA = "HimawariEarthVRC/2.0 (personal VRChat world feed)"
 # 正方形キャンバスに対する比率（左上原点）。高解像度4096・履歴1024で同じ比率。
 DISK_CX, DISK_CY, DISK_R = 0.5, 2010 / 4096, 1990 / 4096
 LABEL_BOX = (0.0, 0.928, 0.27, 1.0)      # 左下の角（円盤の外）に観測時刻を焼き込む
-HI = 4096
+HI = 4032           # 高解像度キャンバス（2016px×2 に分け、各タイルに隣の端を PAD 画素ずつ足して 2048px にする）
 LO = 1024
+PAD = 16            # タイルの継ぎ目対策の重なり幅
+# 真下まわりの詳細（1km格子）: 走査角で ±DETAIL_FRAC×(地球の縁) の正方形。高度400kmで見える範囲をおおう
+DETAIL_FRAC = 0.40
 
 # ---- 気象庁Web画像(601px, 東経140.0°中心) ----
 JMA = "https://www.data.jma.go.jp/mscweb/data/himawari/img/fd_/fd__trm_{hhmm}.jpg"
@@ -191,7 +195,7 @@ def newest_hsd_slot(now):
     return None, []
 
 
-def hsd_rgb(keys, workdir):
+def hsd_download(keys, workdir):
     def get(k):
         p = Path(workdir) / k.split("/")[-1]
         raw, _ = http(f"{S3}/{k}", limit=400 * 1024 * 1024)
@@ -201,6 +205,11 @@ def hsd_rgb(keys, workdir):
     with ThreadPoolExecutor(8) as ex:
         files = list(ex.map(get, keys))
     log(f"HSD取得 {len(files)}件 {time.time() - t0:.0f}s")
+    return files
+
+
+def hsd_rgb(files):
+    t0 = time.time()
     import dask
     import numpy as np
     from satpy import Scene
@@ -220,19 +229,64 @@ def hsd_rgb(keys, workdir):
     return Image.fromarray((arr * 255 + 0.5).astype("uint8"))
 
 
+def hsd_detail(files):
+    """真下まわりを 1km 格子で合成する（低い高度用）。"""
+    t0 = time.time()
+    import dask
+    import numpy as np
+    from satpy import Scene
+    from satpy.writers import get_enhanced_image
+    dask.config.set(num_workers=4)
+    scn = Scene(reader="ahi_hsd", filenames=files)
+    comp = "true_color_reproduction"
+    scn.load([comp], generate=False)
+    a1 = scn["B01"].attrs["area"]
+    h = a1.crs.to_dict().get("h", 35785863.0)
+    half = DETAIL_FRAC * np.arcsin(6378137.0 / 42164160.0) * h
+    scn2 = scn.crop(xy_bbox=(-half, -half, half, half))
+    lr = scn2.resample(scn2["B01"].attrs["area"], resampler="native")
+    arr = np.asarray(get_enhanced_image(lr[comp]).data.values)[:3]
+    arr = np.clip(np.nan_to_num(arr), 0, 1).transpose(1, 2, 0)
+    log(f"詳細合成 {arr.shape} {time.time() - t0:.0f}s")
+    return Image.fromarray((arr * 255 + 0.5).astype("uint8"))
+
+
+def save_tiles(canvas, folder, stem):
+    """canvas(HI四方) を、継ぎ目用の重なり付き 2048px×4枚に分けて保存。0=左上 1=右上 2=左下 3=右下"""
+    import numpy as np
+    a = np.pad(np.asarray(canvas), ((PAD, PAD), (PAD, PAD), (0, 0)), mode="edge")
+    h = HI // 2
+    for i, (x, y) in enumerate([(0, 0), (h, 0), (0, h), (h, h)]):
+        Image.fromarray(a[y:y + h + 2 * PAD, x:x + h + 2 * PAD]).save(folder / f"{stem}_{i}.jpg", quality=90, optimize=True)
+
+
 def write_hi(out, obs, rgb):
     (out / "hi").mkdir(parents=True, exist_ok=True)
     canvas = burn_label(place_disk(rgb, HSD_CX, HSD_CY, HSD_R, HI), obs, "Himawari-9 HSD (JMA via NOAA) / Satpy TCR")
-    h = HI // 2
-    for i, (x, y) in enumerate([(0, 0), (h, 0), (0, h), (h, h)]):   # 0=左上 1=右上 2=左下 3=右下
-        canvas.crop((x, y, x + h, y + h)).save(out / "hi" / f"{obs:%H%M}_{i}.jpg", quality=90, optimize=True)
+    save_tiles(canvas, out / "hi", f"{obs:%H%M}")
 
 
-def carry_hi(out, site_url, slot):
-    (out / "hi").mkdir(parents=True, exist_ok=True)
+def write_detail(out, obs, img):
+    (out / "dt").mkdir(parents=True, exist_ok=True)
+    save_tiles(img.resize((HI, HI), Image.LANCZOS), out / "dt", f"{obs:%H%M}")
+
+
+def carry_tiles(out, site_url, folder, slot):
+    (out / folder).mkdir(parents=True, exist_ok=True)
     for i in range(4):
-        raw, _ = http(site_url + f"hi/{slot}_{i}.jpg")
-        (out / "hi" / f"{slot}_{i}.jpg").write_bytes(raw)
+        raw, _ = http(site_url + f"{folder}/{slot}_{i}.jpg")
+        (out / folder / f"{slot}_{i}.jpg").write_bytes(raw)
+
+
+def carry_hi(out, site_url, slot, with_detail):
+    carry_tiles(out, site_url, "hi", slot)
+    if with_detail:
+        try:
+            carry_tiles(out, site_url, "dt", slot)
+            return True
+        except Exception as e:
+            log("詳細の引き継ぎ失敗", e)
+    return False
 
 
 INDEX = """<!doctype html><meta charset="utf-8"><title>Himawari Earth feed</title>
@@ -266,6 +320,8 @@ def main():
 
     hi_obs = None
     prev_hi = None
+    has_detail = False
+    prev_detail = bool(prev_head and len(prev_head) >= 5 and prev_head[4] == "D")
     if prev_head and len(prev_head) >= 3 and prev_head[0] == "HIMAWARI2" and prev_head[1] != "-":
         prev_hi = datetime.strptime(prev_head[1], "%Y-%m-%dT%H:%MZ").replace(tzinfo=timezone.utc)
     if not args.no_hires:
@@ -273,27 +329,33 @@ def main():
         if t is not None and t == prev_hi:
             log("高解像度: 新しい観測なし。前回分を引き継ぎ")
             try:
-                carry_hi(out, site, t.strftime("%H%M"))
+                has_detail = carry_hi(out, site, t.strftime("%H%M"), prev_detail)
                 hi_obs = t
             except Exception as e:
                 log("引き継ぎ失敗", e)
         elif t is not None:
             with tempfile.TemporaryDirectory() as wd:
                 try:
-                    write_hi(out, t, hsd_rgb(keys, wd))
+                    files = hsd_download(keys, wd)
+                    write_hi(out, t, hsd_rgb(files))
                     hi_obs = t
+                    try:
+                        write_detail(out, t, hsd_detail(files))
+                        has_detail = True
+                    except Exception as e:
+                        log("詳細の作成に失敗（全体画像だけ配信）:", e)
                 except Exception as e:
                     log("高解像度の作成に失敗:", e)
         if hi_obs is None and prev_hi is not None and now - prev_hi < timedelta(hours=3):
             try:
-                carry_hi(out, site, prev_hi.strftime("%H%M"))
+                has_detail = carry_hi(out, site, prev_hi.strftime("%H%M"), prev_detail)
                 hi_obs = prev_hi
             except Exception as e:
                 log("引き継ぎ失敗", e)
         # 直前の高解像度も1組残す（配信情報のキャッシュずれ対策）
         if hi_obs is not None and prev_hi is not None and prev_hi != hi_obs and now - prev_hi < timedelta(hours=3):
             try:
-                carry_hi(out, site, prev_hi.strftime("%H%M"))
+                carry_hi(out, site, prev_hi.strftime("%H%M"), prev_detail)
             except Exception:
                 pass
 
@@ -304,7 +366,7 @@ def main():
     hi_s = f"{hi_obs:%Y-%m-%dT%H:%MZ}" if hi_obs else "-"
     slot_s = f"{hi_obs:%H%M}" if hi_obs else "-"
     (out / "latest.txt").write_text(
-        f"HIMAWARI2|{hi_s}|{slot_s}|{processed:%Y-%m-%dT%H:%M:%SZ}\n"
+        f"HIMAWARI2|{hi_s}|{slot_s}|{processed:%Y-%m-%dT%H:%M:%SZ}|{'D' if has_detail else '-'}\n"
         + ",".join(f"{o:%Y%m%d%H%M}" for o in hist) + "\n", encoding="utf-8")
     (out / "index.html").write_text(INDEX.format(
         hi=(f"{hi_obs:%Y-%m-%d %H:%M} UTC" if hi_obs else "なし"), n=len(hist),
