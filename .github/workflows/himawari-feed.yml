@@ -1,4 +1,5 @@
-# 10分ごとに、ひまわりの最新観測（高解像度）と過去24時間の履歴を GitHub Pages に配信する。
+# 10分ごとに、ひまわりの最新観測と「あさひ・まひる・ゆうひ」（高解像度一式）を GitHub Pages に配信する。
+# あさひ・まひる・ゆうひ は Actions のキャッシュ（store/）で回をまたいで持つ。
 # Settings > Pages > Source は「GitHub Actions」。
 # GitHub の定期実行(schedule)は新しいリポジトリだと動き出さないことがあるため、
 # 実行の最後に「次の回」を自分で予約する（relay）。止めたいときは
@@ -19,7 +20,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -33,7 +34,20 @@ jobs:
           key: pyspectral-0.14.3
       - run: pip install -r pipeline/requirements.txt
       - run: python -c "from pyspectral.utils import download_luts, download_rsr; download_rsr(); download_luts(aerosol_types=['rayleigh_only'])"
-      - run: python pipeline/feed.py --out site --site-url "https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/"
+      - uses: actions/cache/restore@v4
+        with:
+          path: store
+          key: himawari-store-none
+          restore-keys: himawari-store-
+      - run: python pipeline/feed.py --out site --store store --site-url "https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/"
+      - id: storekey
+        run: echo "key=himawari-store-$(sha256sum store/sets.json 2>/dev/null | cut -c1-16 || echo empty)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/save@v4
+        if: hashFiles('store/sets.json') != ''
+        continue-on-error: true
+        with:
+          path: store
+          key: ${{ steps.storekey.outputs.key }}
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site
