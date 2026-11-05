@@ -34,6 +34,10 @@ jobs:
           key: pyspectral-0.14.3
       - run: pip install -r pipeline/requirements.txt
       - run: python -c "from pyspectral.utils import download_luts, download_rsr; download_rsr(); download_luts(aerosol_types=['rayleigh_only'])"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/himawari_bm
+          key: blackmarble-2016-v1
       - uses: actions/cache/restore@v4
         with:
           path: store
