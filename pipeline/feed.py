@@ -128,6 +128,170 @@ def hsd_download(keys, workdir):
     return files
 
 
+# ---------------- 夜側（赤外の雲を月明かり相当で＋街明かりの地図） ----------------
+# 夜の可視画像は真っ暗なので、その時刻のひまわり赤外観測(B13, 10.4µm)から雲の濃さを推定し、
+# 月の高さと満ち欠けに応じた明るさで描く（見やすく強調）。街明かりは NASA Black Marble 2016（年平均の地図）を
+# 雲の濃さで減光して重ねる。どちらも「観測そのもの」ではないので、受け手側の表示で区別する。
+BM_URL = "https://assets.science.nasa.gov/content/dam/science/esd/eo/images/imagerecords/144000/144897/"
+BM_FILES = {"global": "BlackMarble_2016_3km_gray.jpg",       # 13500x6750, 経度-180..180, 緯度90..-90
+            "D1": "BlackMarble_2016_D1_gray.jpg",            # 21600x21600, 経度90..180, 緯度90..0 (500m)
+            "D2": "BlackMarble_2016_D2_gray.jpg"}            # 21600x21600, 経度90..180, 緯度0..-90
+BM_DIR = Path(os.environ.get("HIMAWARI_BM_DIR", Path.home() / ".cache" / "himawari_bm"))
+NIGHT_MOON_GAIN = 0.32       # 満月が真上のときの雲の明るさ（表示値。実際より強調）
+NIGHT_BASE = 0.012           # 月がなくても星明かりでごくわずかに
+LIGHTS_GAIN = 1.0
+LIGHTS_COLOR = (1.0, 0.76, 0.42)
+MOON_COLOR = (0.78, 0.84, 0.95)
+
+
+def bm_path(key):
+    BM_DIR.mkdir(parents=True, exist_ok=True)
+    p = BM_DIR / BM_FILES[key]
+    if not p.exists():
+        raw, _ = http(BM_URL + BM_FILES[key], limit=200 * 1024 * 1024)
+        tmp = p.with_suffix(".part")
+        tmp.write_bytes(raw)
+        tmp.rename(p)
+    return p
+
+
+class Lights:
+    """街明かり 0..1。日本付近（90°E〜180°）は 500m、ほかは 3km の地図から。地図は一度だけ読む。"""
+    def __init__(self, need_d1, need_d2):
+        import numpy as np
+        Image.MAX_IMAGE_PIXELS = None
+        self.g = np.asarray(Image.open(bm_path("global")).convert("L"))
+        self.t = {}
+        for key, need in (("D1", need_d1), ("D2", need_d2)):
+            if need:
+                try:
+                    self.t[key] = np.asarray(Image.open(bm_path(key)).convert("L"))
+                except Exception as e:
+                    log("街明かり 500m 地図を使えません（3kmで代用）:", key, e)
+
+    def at(self, lon, lat):
+        import numpy as np
+        out = np.zeros(lon.shape, np.float32)
+        ok = np.isfinite(lon) & np.isfinite(lat)
+        h, w = self.g.shape
+        x = np.clip(((lon + 180) / 360 * w).astype(np.int32), 0, w - 1)
+        y = np.clip(((90 - lat) / 180 * h).astype(np.int32), 0, h - 1)
+        out[ok] = self.g[y[ok], x[ok]]
+        for key, la0 in (("D1", 90.0), ("D2", 0.0)):
+            t = self.t.get(key)
+            if t is None:
+                continue
+            m = ok & (lon >= 90) & (lat <= la0) & (lat > la0 - 90)
+            if not m.any():
+                continue
+            n = t.shape[0]
+            xi = np.clip(((lon[m] - 90) / 90 * n).astype(np.int32), 0, n - 1)
+            yi = np.clip(((la0 - lat[m]) / 90 * n).astype(np.int32), 0, n - 1)
+            out[m] = t[yi, xi]
+        v = np.clip((out - 22.0) / 233.0, 0, 1)        # 地図の地の明るさを落とす
+        return v ** 1.4
+
+
+def moon_state(t):
+    """月の赤経・赤緯[rad]と、照らされている割合（0..1）。低精度（約0.5°）。"""
+    import math
+    d = (t - datetime(1999, 12, 31, tzinfo=timezone.utc)).total_seconds() / 86400.0
+    rad = math.radians
+    N = rad((125.1228 - 0.0529538083 * d) % 360); i = rad(5.1454); w = rad((318.0634 + 0.1643573223 * d) % 360)
+    e = 0.054900; M = rad((115.3654 + 13.0649929509 * d) % 360)
+    E = M + e * math.sin(M) * (1 + e * math.cos(M))
+    for _ in range(5):
+        E = E - (E - e * math.sin(E) - M) / (1 - e * math.cos(E))
+    xv = math.cos(E) - e; yv = math.sqrt(1 - e * e) * math.sin(E)
+    v = math.atan2(yv, xv)
+    xh = math.cos(N) * math.cos(v + w) - math.sin(N) * math.sin(v + w) * math.cos(i)
+    yh = math.sin(N) * math.cos(v + w) + math.cos(N) * math.sin(v + w) * math.cos(i)
+    zh = math.sin(v + w) * math.sin(i)
+    lon_m = math.atan2(yh, xh); lat_m = math.atan2(zh, math.hypot(xh, yh))
+    Ms = rad((356.0470 + 0.9856002585 * d) % 360); ws = rad((282.9404 + 4.70935e-5 * d) % 360)
+    lon_s = (Ms + ws + rad(1.915) * math.sin(Ms) + rad(0.020) * math.sin(2 * Ms))
+    eps = rad(23.4393 - 3.563e-7 * d)
+    x = math.cos(lon_m) * math.cos(lat_m); y = math.sin(lon_m) * math.cos(lat_m); z = math.sin(lat_m)
+    ye = y * math.cos(eps) - z * math.sin(eps); ze = y * math.sin(eps) + z * math.cos(eps)
+    ra = math.atan2(ye, x); dec = math.asin(ze)
+    elong = math.acos(math.cos(lat_m) * math.cos(lon_m - lon_s))
+    return ra, dec, (1 - math.cos(elong)) / 2
+
+
+def gmst_rad(t):
+    import math
+    d = (t - J2000).total_seconds() / 86400.0
+    return math.radians((280.46061837 + 360.98564736629 * d) % 360)
+
+
+def cloud_from_bt(bt, lat, cell):
+    """赤外の輝度温度[K]から雲の濃さ 0..1 を推定。cell=約100kmの画素数。
+    晴れた地表の温度を、まわり約900kmの暖かいほう(95%)と緯度ごとの目安の大きいほうで見積もり、それより冷たいほど雲。"""
+    import numpy as np
+    from scipy import ndimage
+    H, W = bt.shape
+    b = np.where(np.isfinite(bt), bt, np.nan)
+    hb, wb = H // cell, W // cell
+    if hb >= 3 and wb >= 3:
+        blk = b[:hb * cell, :wb * cell].reshape(hb, cell, wb, cell).transpose(0, 2, 1, 3).reshape(hb, wb, -1)
+        p95 = np.nanpercentile(blk, 95, axis=-1)
+        p95 = np.where(np.isfinite(p95), p95, np.nanmedian(p95))
+        p95 = ndimage.maximum_filter(p95, size=9, mode="nearest")
+        clear = ndimage.zoom(p95, (H / hb, W / wb), order=1)[:H, :W]
+        if clear.shape != bt.shape:
+            clear = np.pad(clear, ((0, H - clear.shape[0]), (0, W - clear.shape[1])), mode="edge")
+    else:
+        clear = np.full(bt.shape, np.nanpercentile(b, 95))
+    climo = 300.0 - 25.0 * (np.nan_to_num(np.abs(lat), nan=0) / 60.0) ** 2
+    clear = np.maximum(clear, climo - 25.0)
+    c = np.clip((clear - b - 3.0) / 25.0, 0, 1) ** 0.8
+    return np.nan_to_num(c).astype(np.float32)
+
+
+def add_night(arr, bt, area, t_obs, cell, rows=400):
+    """arr: 表示用RGB (H,W,3) 0..1。夜側に雲（月明かり相当）と街明かりを足して返す（メモリ節約のため行ごとに処理）。"""
+    import numpy as np
+    from pyorbital.astronomy import sun_zenith_angle
+    t0 = time.time()
+    arr = np.asarray(arr, np.float32)
+    tmid = t_obs + timedelta(minutes=5)
+    H, W = bt.shape
+    # 雲の推定に使う緯度（粗くてよい）
+    lat_c = np.asarray(area.get_lonlats(dtype=np.float32, data_slice=(slice(None), slice(W // 2, W // 2 + 1)))[1])
+    lat_c = np.where(np.abs(lat_c) > 1e3, np.nan, lat_c).reshape(H, 1)     # 行ごとのおおよその緯度
+    cloud = cloud_from_bt(bt, lat_c, cell)
+    ra, dec, illum = moon_state(tmid)
+    g0 = gmst_rad(tmid)
+    lights = None
+    any_night = False
+    for r0 in range(0, H, rows):
+        r1 = min(H, r0 + rows)
+        lon, lat = area.get_lonlats(dtype=np.float32, data_slice=(slice(r0, r1), slice(None)))
+        lon = np.where(np.abs(lon) > 1e3, np.nan, lon).astype(np.float32)
+        lat = np.where(np.abs(lat) > 1e3, np.nan, lat).astype(np.float32)
+        okk = np.isfinite(lon)
+        if not okk.any():
+            continue
+        sza = sun_zenith_angle(tmid.replace(tzinfo=None), np.nan_to_num(lon), np.nan_to_num(lat))
+        night = np.clip((sza - 90.0) / 8.0, 0, 1).astype(np.float32)
+        night[~okk] = 0
+        if night.max() <= 0:
+            continue
+        any_night = True
+        if lights is None:
+            lights = Lights(need_d1=True, need_d2=True)
+        Hh = g0 + np.radians(np.nan_to_num(lon)) - ra
+        la = np.radians(np.nan_to_num(lat))
+        sin_alt = (np.sin(la) * np.sin(dec) + np.cos(la) * np.cos(dec) * np.cos(Hh)).astype(np.float32)
+        moon = NIGHT_MOON_GAIN * illum * np.clip(sin_alt, 0, 1) ** 0.7 + NIGHT_BASE
+        c = cloud[r0:r1]
+        li = lights.at(lon, lat) * (1 - 0.9 * c) * LIGHTS_GAIN
+        add = (c * moon)[..., None] * np.array(MOON_COLOR, np.float32) + li[..., None] * np.array(LIGHTS_COLOR, np.float32)
+        arr[r0:r1] = np.clip(arr[r0:r1] + night[..., None] * add, 0, 1)
+    log(f"夜側 合成 {time.time() - t0:.0f}s 夜あり={any_night} 月の照らされた割合 {illum:.2f}")
+    return arr
+
+
 def hsd_rgb(files):
     t0 = time.time()
     import dask
@@ -137,14 +301,22 @@ def hsd_rgb(files):
     dask.config.set(num_workers=4)
     scn = Scene(reader="ahi_hsd", filenames=files)
     comp = "true_color_reproduction"
-    scn.load([comp], generate=False)
+    scn.load([comp, "B13"], generate=False)
     a1 = scn.coarsest_area()
     f = a1.shape[0] // 5500
     lr = scn.resample(a1.aggregate(x=f, y=f) if f > 1 else a1, resampler="native")
-    arr = np.asarray(get_enhanced_image(lr[comp]).data.values)[:3]
+    arr = np.asarray(get_enhanced_image(lr[comp]).data.values, np.float32)[:3]
     arr = np.clip(np.nan_to_num(arr), 0, 1).transpose(1, 2, 0)
     if arr.shape[:2] != (5500, 5500):
         raise ValueError(f"想定外の格子 {arr.shape}")
+    try:
+        bt = np.asarray(lr["B13"].values, np.float32)
+        area, st = lr[comp].attrs["area"], lr[comp].attrs["start_time"].replace(tzinfo=timezone.utc)
+        del lr, scn
+        import gc; gc.collect()
+        arr = add_night(arr, bt, area, st, 50)
+    except Exception as e:
+        log("夜側の合成に失敗（夜側は観測のまま）:", e)
     log(f"合成 {time.time() - t0:.0f}s")
     return Image.fromarray((arr * 255 + 0.5).astype("uint8"))
 
@@ -166,7 +338,7 @@ def hsd_region(files, box, finest, size):
     files = [f for f in files if int(re.search(r"_S(\d\d)10", f).group(1)) in segs]
     scn = Scene(reader="ahi_hsd", filenames=files)
     comp = "true_color_reproduction"
-    scn.load([comp], generate=False)
+    scn.load([comp, "B13"], generate=False)
     h = scn["B01"].attrs["area"].crs.to_dict().get("h", 35785863.0)
     x0, y0, x1, y1 = [v * h for v in box]
     m = 0.02 * max(x1 - x0, y1 - y0)
@@ -174,8 +346,13 @@ def hsd_region(files, box, finest, size):
     area = scn2.finest_area() if finest else scn2["B01"].attrs["area"]
     lr = scn2.resample(area, resampler="native")
     data = lr[comp]
-    arr = np.asarray(get_enhanced_image(data).data.values)[:3]
+    arr = np.asarray(get_enhanced_image(data).data.values, np.float32)[:3]
     arr = np.clip(np.nan_to_num(arr), 0, 1).transpose(1, 2, 0)
+    try:
+        km = 0.5 if finest else 1.0
+        arr = add_night(arr, np.asarray(lr["B13"].values, np.float32), data.attrs["area"], data.attrs["start_time"].replace(tzinfo=timezone.utc), int(100 / km))
+    except Exception as e:
+        log("夜側の合成に失敗（夜側は観測のまま）:", e)
     img = Image.fromarray((arr * 255 + 0.5).astype("uint8"))
     ar = data.attrs["area"]
     xl, yl, xu, yu = ar.area_extent
@@ -245,7 +422,7 @@ def make_set_child(dest):
     with tempfile.TemporaryDirectory() as wd:
         files = hsd_download(keys, wd)
         canvas = burn_label(place_disk(hsd_rgb(files), HSD_CX, HSD_CY, HSD_R, HI), obs,
-                            "Himawari-9 HSD (JMA via NOAA) / Satpy TCR")
+                            "Himawari-9 HSD/Satpy TCR; night: IR+lights")
         save_tiles(canvas, dest, "hi")
         del canvas
         flags = ""
