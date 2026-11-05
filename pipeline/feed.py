@@ -56,7 +56,7 @@ JAPAN_BOX = (-0.050, 0.066, 0.012, 0.122)
 
 # ---- NOAA公開のHSD(東経140.7°, 2km格子5500px) ----
 S3 = "https://noaa-himawari9.s3.amazonaws.com"
-HSD_BANDS = ("B01", "B02", "B03", "B04", "B13")
+HSD_BANDS = ("B01", "B02", "B03", "B04", "B07", "B13", "B15")   # B07/B13/B15 は夜の雲の見分け用
 HSD_CX = HSD_CY = 2750.0
 HSD_R = 2717.08                                  # 赤道の縁までの画素数（area_extent から計算）
 HSD_PIX = 0.15185208 / HSD_R                     # 2km格子1画素の走査角[rad]
@@ -255,7 +255,32 @@ def cloud_from_bt(bt, lat, cell):
     return np.nan_to_num(c).astype(np.float32)
 
 
-def add_night(arr, bt, area, t_obs, cell, res_km, rows=400):
+def night_clouds(bts, lat_c, cell, up):
+    """夜の雲を3つの赤外で見分ける（気象庁などの「夜の雲」判別と同じ考え方）。
+    戻り: show（月明かりで見える雲の濃さ）, block（街明かりを消す割合）, thin（薄い巻雲で光がにじむ割合）"""
+    import numpy as np
+    from scipy import ndimage
+    def smooth(b):
+        b = np.where(np.isfinite(b), b, np.nanmean(b))
+        return ndimage.gaussian_filter(b, sigma=0.6 * up).astype(np.float32) if up > 1 else b.astype(np.float32)
+    b13 = smooth(bts["B13"])
+    cold = cloud_from_bt(b13, lat_c, cell)                          # 冷たいほど（高い雲ほど）大きい
+    if "B15" in bts and "B07" in bts:
+        b15 = smooth(bts["B15"]); b07 = smooth(bts["B07"])
+        ci = np.clip((b13 - b15 - 1.0) / 3.0, 0, 1)                # 11-12µm 差が大きい = 薄い氷の雲（巻雲）
+        low = np.clip((b13 - b07 - 1.5) / 3.0, 0, 1)               # 3.9µm が冷たく出る = 低い水の雲・霧
+        low *= np.clip((b13 - 250.0) / 15.0, 0, 1)                 # 冷たい雲の上では判定しない
+        del b15, b07
+    else:
+        ci = np.zeros_like(cold); low = np.zeros_like(cold)
+    thin = cold * ci                                                # 冷たいが薄い雲
+    thick_cold = cold * (1 - ci)
+    block = np.clip(np.maximum(thick_cold, low) + 0.35 * thin, 0, 1)
+    show = np.clip(np.maximum(cold, low), 0, 1)
+    return show, block, thin
+
+
+def add_night(arr, bts, area, t_obs, cell, res_km, split_lights=False, rows=400):
     """arr: 表示用RGB (H,W,3) 0..1。夜側に雲（月明かり相当）と街明かりを足して返す。
     bt は res_km の格子に「そのまま拡大」された赤外（2km）。四角いむらが出ないよう、なめらかにしてから使う。"""
     import numpy as np
@@ -264,14 +289,11 @@ def add_night(arr, bt, area, t_obs, cell, res_km, rows=400):
     t0 = time.time()
     arr = np.asarray(arr, np.float32)
     tmid = t_obs + timedelta(minutes=5)
-    H, W = bt.shape
+    H, W = bts["B13"].shape
     up = max(1.0, 2.0 / res_km)                    # 赤外の1画素がこの格子の何画素か
-    if up > 1:
-        b = np.where(np.isfinite(bt), bt, np.nanmean(bt))
-        bt = ndimage.gaussian_filter(b, sigma=0.6 * up).astype(np.float32)
     lat_c = np.asarray(area.get_lonlats(dtype=np.float32, data_slice=(slice(None), slice(W // 2, W // 2 + 1)))[1])
     lat_c = np.where(np.abs(lat_c) > 1e3, np.nan, lat_c).reshape(H, 1)     # 行ごとのおおよその緯度
-    cloud = cloud_from_bt(bt, lat_c, cell)
+    cloud, block, thin = night_clouds(bts, lat_c, cell, up)
     ra, dec, illum = moon_state(tmid)
     g0 = gmst_rad(tmid)
     # 1) 夜の重み・月の高さ・街明かりの地図を、行ごとに求める
@@ -302,24 +324,27 @@ def add_night(arr, bt, area, t_obs, cell, res_km, rows=400):
         lmap[r0:r1] = lights.at(lon, lat)
     if night.max() <= 0:
         log("夜側なし")
-        return arr
+        return (arr, None) if split_lights else arr
     del lights
     # 2) 街明かり: 地図のにじみを差し引き、暗い部分を沈めて芯を残す（約1.5kmのぼかしとの差）
     halo = ndimage.gaussian_filter(lmap, sigma=max(1.0, 1.5 / res_km))
     sharp = np.clip((lmap - LIGHTS_HALO_CUT * halo) / (1 - LIGHTS_HALO_CUT), 0, 255)
     v = np.clip((sharp - LIGHTS_FLOOR) / (255.0 - LIGHTS_FLOOR), 0, 1)
     li = LIGHTS_GAIN * v ** LIGHTS_GAMMA
-    # 雲の下の街: 光がぼやけて広がる（薄く大きくにじむ）
-    glow = ndimage.gaussian_filter(li, sigma=max(1.0, 4.0 / res_km)) * 0.45
-    li = li * (1 - cloud) + glow * cloud * (1 - 0.6 * cloud)
-    del lmap, halo, sharp, glow
+    # 雲: 厚い雲・低い雲の下は見えない。薄い巻雲の下はぼんやりにじむ
+    glow = ndimage.gaussian_filter(li, sigma=max(1.0, 4.0 / res_km)) * 0.5 * thin * (1 - block)
+    li = li * (1 - block)
+    del lmap, halo, sharp
     # 3) 色: 明るい中心ほど白（LED）、暗いほどオレンジ（ナトリウム灯）
     k = np.clip((v - 0.25) / 0.6, 0, 1)[..., None]
     col = np.array(LIGHTS_DIM, np.float32) * (1 - k) + np.array(LIGHTS_CORE, np.float32) * k
-    add = (cloud * moon)[..., None] * np.array(MOON_COLOR, np.float32) + li[..., None] * col
-    arr = np.clip(arr + night[..., None] * add, 0, 1)
+    clouds = (cloud * moon)[..., None] * np.array(MOON_COLOR, np.float32)
     log(f"夜側 合成 {time.time() - t0:.0f}s 月の照らされた割合 {illum:.2f}")
-    return arr
+    if split_lights:
+        # 街明かりは別の画像で渡す（受け手側で細かい光の点として描く）。値 = 明るさ/LIGHTS_GAIN
+        # 赤 = 点として描く街明かり、緑 = 薄い雲ににじんだ光（なめらかに描く）
+        return np.clip(arr + night[..., None] * clouds, 0, 1), np.stack([np.clip(night * li / LIGHTS_GAIN, 0, 1), np.clip(night * glow / LIGHTS_GAIN, 0, 1)], -1)
+    return np.clip(arr + night[..., None] * (clouds + (li + glow)[..., None] * col), 0, 1)
 
 
 def hsd_rgb(files):
@@ -331,7 +356,7 @@ def hsd_rgb(files):
     dask.config.set(num_workers=4)
     scn = Scene(reader="ahi_hsd", filenames=files)
     comp = "true_color_reproduction"
-    scn.load([comp, "B13"], generate=False)
+    scn.load([comp, "B07", "B13", "B15"], generate=False)
     a1 = scn.coarsest_area()
     f = a1.shape[0] // 5500
     lr = scn.resample(a1.aggregate(x=f, y=f) if f > 1 else a1, resampler="native")
@@ -340,18 +365,18 @@ def hsd_rgb(files):
     if arr.shape[:2] != (5500, 5500):
         raise ValueError(f"想定外の格子 {arr.shape}")
     try:
-        bt = np.asarray(lr["B13"].values, np.float32)
+        bts = {b: np.asarray(lr[b].values, np.float32) for b in ("B07", "B13", "B15")}
         area, st = lr[comp].attrs["area"], lr[comp].attrs["start_time"].replace(tzinfo=timezone.utc)
         del lr, scn
         import gc; gc.collect()
-        arr = add_night(arr, bt, area, st, 50, 2.0)
+        arr = add_night(arr, bts, area, st, 50, 2.0)
     except Exception as e:
         log("夜側の合成に失敗（夜側は観測のまま）:", e)
     log(f"合成 {time.time() - t0:.0f}s")
     return Image.fromarray((arr * 255 + 0.5).astype("uint8"))
 
 
-def hsd_region(files, box, finest, size):
+def hsd_region(files, box, finest, size, split_lights=False):
     """走査角の長方形 box=(x0,y0,x1,y1)[rad] を size 四方の画像にする。
     finest=True なら 0.5km 格子（B03 で鮮鋭化）、False なら 1km 格子で合成する。
     切り出しは格子に合わせて丸められるので、最後に area の座標から正確に切り直す。"""
@@ -368,7 +393,7 @@ def hsd_region(files, box, finest, size):
     files = [f for f in files if int(re.search(r"_S(\d\d)10", f).group(1)) in segs]
     scn = Scene(reader="ahi_hsd", filenames=files)
     comp = "true_color_reproduction"
-    scn.load([comp, "B13"], generate=False)
+    scn.load([comp, "B07", "B13", "B15"], generate=False)
     h = scn["B01"].attrs["area"].crs.to_dict().get("h", 35785863.0)
     x0, y0, x1, y1 = [v * h for v in box]
     m = 0.02 * max(x1 - x0, y1 - y0)
@@ -378,9 +403,16 @@ def hsd_region(files, box, finest, size):
     data = lr[comp]
     arr = np.asarray(get_enhanced_image(data).data.values, np.float32)[:3]
     arr = np.clip(np.nan_to_num(arr), 0, 1).transpose(1, 2, 0)
+    lights = None
     try:
         km = 0.5 if finest else 1.0
-        arr = add_night(arr, np.asarray(lr["B13"].values, np.float32), data.attrs["area"], data.attrs["start_time"].replace(tzinfo=timezone.utc), int(100 / km), km)
+        bts = {b: np.asarray(lr[b].values, np.float32) for b in ("B07", "B13", "B15")}
+        res = add_night(arr, bts, data.attrs["area"], data.attrs["start_time"].replace(tzinfo=timezone.utc), int(100 / km), km, split_lights)
+        if split_lights:
+            arr, lights = res
+        else:
+            arr = res
+        del bts
     except Exception as e:
         log("夜側の合成に失敗（夜側は観測のまま）:", e)
     img = Image.fromarray((arr * 255 + 0.5).astype("uint8"))
@@ -390,11 +422,19 @@ def hsd_region(files, box, finest, size):
     dx, dy = (xu - xl) / W, (yu - yl) / H
     if not (xl <= x0 and x1 <= xu and yl <= y0 and y1 <= yu):
         raise ValueError(f"切り出し範囲が足りない {ar.area_extent} {(x0, y0, x1, y1)}")
-    out = img.transform((size, size), Image.AFFINE,
-                        ((x1 - x0) / size / dx, 0, (x0 - xl) / dx, 0, (y1 - y0) / size / dy, (yu - y1) / dy),
-                        resample=Image.BICUBIC)
+    aff = ((x1 - x0) / size / dx, 0, (x0 - xl) / dx, 0, (y1 - y0) / size / dy, (yu - y1) / dy)
+    out = img.transform((size, size), Image.AFFINE, aff, resample=Image.BICUBIC)
     log(f"部分合成 {'0.5km' if finest else '1km'} {img.size} -> {size} {time.time() - t0:.0f}s")
-    return out
+    if not split_lights:
+        return out
+    # 街明かりの明るさの地図（受け手が sRGB として読むので、1/2.2 乗して 8bit に）
+    if lights is None:
+        lights = np.zeros(arr.shape[:2] + (2,), np.float32)
+    rgb = np.zeros(arr.shape[:2] + (3,), np.float32)
+    rgb[..., :2] = lights
+    limg = Image.fromarray((np.clip(rgb, 0, 1) ** (1 / 2.2) * 255 + 0.5).astype("uint8"))
+    lout = limg.transform((size, size), Image.AFFINE, aff, resample=Image.BILINEAR)
+    return out, lout
 
 
 def hsd_detail(files):
@@ -404,20 +444,21 @@ def hsd_detail(files):
 
 
 def hsd_japan(files):
-    """日本まわりを 0.5km 格子で（ISS高度モード用）。"""
-    return hsd_region(files, JAPAN_BOX, True, HI)
+    """日本まわりを 0.5km 格子で（ISS高度モード用）。戻り: (画像, 街明かりの明るさの地図)"""
+    return hsd_region(files, JAPAN_BOX, True, HI, split_lights=True)
 
 
-def save_tiles(canvas, folder, stem):
+def save_tiles(canvas, folder, stem, exact=False):
     """canvas(HI四方) を、継ぎ目用の重なり付き 2048px×4枚に分けて保存。0=左上 1=右上 2=左下 3=右下"""
     import numpy as np
     a = np.pad(np.asarray(canvas), ((PAD, PAD), (PAD, PAD), (0, 0)), mode="edge")
     h = HI // 2
     for i, (x, y) in enumerate([(0, 0), (h, 0), (0, h), (h, h)]):
-        Image.fromarray(a[y:y + h + 2 * PAD, x:x + h + 2 * PAD]).save(folder / f"{stem}_{i}.jpg", quality=90, optimize=True)
+        opt = {"quality": 95, "subsampling": 0} if exact else {"quality": 90}   # exact: 色の段ごとに別の値を入れた画像
+        Image.fromarray(a[y:y + h + 2 * PAD, x:x + h + 2 * PAD]).save(folder / f"{stem}_{i}.jpg", optimize=True, **opt)
 
 
-LAYERS = (("hi", None), ("dt", "D"), ("jp", "J"))
+LAYERS = (("hi", None), ("dt", "D"), ("jp", "J"), ("jl", "L"))
 SETS = (("asahi", -60.0), ("mahiru", 0.0), ("yuhi", 60.0))   # 名前と、ひまわり直下での太陽の時角[度]
 SUB_LON = 140.7
 JST = timedelta(hours=9)
@@ -456,12 +497,19 @@ def make_set_child(dest):
         save_tiles(canvas, dest, "hi")
         del canvas
         flags = ""
-        for layer, f, make in (("dt", "D", hsd_detail), ("jp", "J", hsd_japan)):
-            try:
-                save_tiles(make(files), dest, layer)
-                flags += f
-            except Exception as e:
-                log(f"{layer} の作成に失敗（その層なしで配信）:", e)
+        try:
+            save_tiles(hsd_detail(files), dest, "dt")
+            flags += "D"
+        except Exception as e:
+            log("dt の作成に失敗（その層なしで配信）:", e)
+        try:
+            jp, jl = hsd_japan(files)
+            save_tiles(jp, dest, "jp")
+            flags += "J"
+            save_tiles(jl, dest, "jl", exact=True)
+            flags += "L"
+        except Exception as e:
+            log("jp/jl の作成に失敗（その層なしで配信）:", e)
     (dest / "flags.txt").write_text(flags, encoding="utf-8")
     return 0
 
@@ -563,7 +611,7 @@ def main():
 
     slot_name = lambda layer, k, t: f"{layer}/{t:%H%M}_{k}.jpg"
 
-    def carry_latest(t, flags, layers=("hi", "dt", "jp")):
+    def carry_latest(t, flags, layers=("hi", "dt", "jp", "jl")):
         got = ""
         for layer, f in LAYERS:
             if layer in layers and (f is None or f in flags):
