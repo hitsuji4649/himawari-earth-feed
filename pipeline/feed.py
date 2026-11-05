@@ -146,6 +146,7 @@ LIGHTS_HALO_CUT = 0.55       # 元の地図に含まれる光のにじみを差�
 LIGHTS_DIM = (1.0, 0.62, 0.30)    # 暗めの明かり（ナトリウム灯寄りのオレンジ）
 LIGHTS_CORE = (1.0, 0.88, 0.70)   # 明るい中心部（LED寄りの白）
 MOON_COLOR = (0.78, 0.84, 0.95)
+THIN_CLOUD_DIM = 0.8         # 薄い巻雲の下で街明かりを減らす割合
 
 
 def bm_path(key):
@@ -257,7 +258,7 @@ def cloud_from_bt(bt, lat, cell):
 
 def night_clouds(bts, lat_c, cell, up):
     """夜の雲を3つの赤外で見分ける（気象庁などの「夜の雲」判別と同じ考え方）。
-    戻り: show（月明かりで見える雲の濃さ）, block（街明かりを消す割合）, thin（薄い巻雲で光がにじむ割合）"""
+    戻り: show（月明かりで見える雲の濃さ）, block（街明かりを消す割合）, thin（薄い巻雲の割合）"""
     import numpy as np
     from scipy import ndimage
     def smooth(b):
@@ -275,7 +276,7 @@ def night_clouds(bts, lat_c, cell, up):
         ci = np.zeros_like(cold); low = np.zeros_like(cold)
     thin = cold * ci                                                # 冷たいが薄い雲
     thick_cold = cold * (1 - ci)
-    block = np.clip(np.maximum(thick_cold, low) + 0.35 * thin, 0, 1)
+    block = np.clip(np.maximum(thick_cold, low) + THIN_CLOUD_DIM * thin, 0, 1)
     show = np.clip(np.maximum(cold, low), 0, 1)
     return show, block, thin
 
@@ -331,8 +332,8 @@ def add_night(arr, bts, area, t_obs, cell, res_km, split_lights=False, rows=400)
     sharp = np.clip((lmap - LIGHTS_HALO_CUT * halo) / (1 - LIGHTS_HALO_CUT), 0, 255)
     v = np.clip((sharp - LIGHTS_FLOOR) / (255.0 - LIGHTS_FLOOR), 0, 1)
     li = LIGHTS_GAIN * v ** LIGHTS_GAMMA
-    # 雲: 厚い雲・低い雲の下は見えない。薄い巻雲の下はぼんやりにじむ
-    glow = ndimage.gaussian_filter(li, sigma=max(1.0, 4.0 / res_km)) * 0.5 * thin * (1 - block)
+    # 雲: 厚い雲・低い雲の下は見えない。薄い巻雲の下もかなり暗くなる（にじませない）
+    glow = np.zeros_like(li)
     li = li * (1 - block)
     del lmap, halo, sharp
     # 3) 色: 明るい中心ほど白（LED）、暗いほどオレンジ（ナトリウム灯）
