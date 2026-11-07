@@ -147,6 +147,26 @@ LIGHTS_DIM = (1.0, 0.62, 0.30)    # 暗めの明かり（ナトリウム灯寄�
 LIGHTS_CORE = (1.0, 0.88, 0.70)   # 明るい中心部（LED寄りの白）
 MOON_COLOR = (0.78, 0.84, 0.95)
 THIN_CLOUD_DIM = 0.8         # 薄い巻雲の下で街明かりを減らす割合
+# くっきり処理（センサーのぼけを戻すアンシャープ）。データにない模様は足さない: 結果を周囲3x3の明るさの範囲に収める
+SHARPEN = {0.5: (1.2, 1.0), 1.0: (1.0, 0.6)}   # 格子km: (ぼけの幅[画素], 強さ)
+
+
+def sharpen(arr, km):
+    """arr: (H,W,3) 0..1。明るさだけをくっきりさせ、輪郭のふちに白黒の縁取り（ハロー）が出ないよう抑える。"""
+    import numpy as np
+    from scipy import ndimage
+    if km not in SHARPEN:
+        return arr
+    sigma, amount = SHARPEN[km]
+    t0 = time.time()
+    Y = (0.2126 * arr[..., 0] + 0.7152 * arr[..., 1] + 0.0722 * arr[..., 2]).astype(np.float32)
+    Ys = Y + amount * (Y - ndimage.gaussian_filter(Y, sigma))
+    lo = ndimage.minimum_filter(Y, size=3) - 0.01
+    hi = ndimage.maximum_filter(Y, size=3) + 0.01
+    Ys = np.clip(Ys, lo, hi)
+    out = np.clip(arr + (Ys - Y)[..., None], 0, 1)
+    log(f"くっきり処理 {km}km {time.time() - t0:.0f}s")
+    return out
 
 
 def bm_path(key):
@@ -404,6 +424,7 @@ def hsd_region(files, box, finest, size, split_lights=False):
     data = lr[comp]
     arr = np.asarray(get_enhanced_image(data).data.values, np.float32)[:3]
     arr = np.clip(np.nan_to_num(arr), 0, 1).transpose(1, 2, 0)
+    arr = sharpen(arr, 0.5 if finest else 1.0)
     lights = None
     try:
         km = 0.5 if finest else 1.0
