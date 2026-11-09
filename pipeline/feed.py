@@ -147,7 +147,11 @@ LIGHTS_DIM = (1.0, 0.62, 0.30)    # 暗めの明かり（ナトリウム灯寄�
 LIGHTS_CORE = (1.0, 0.88, 0.70)   # 明るい中心部（LED寄りの白）
 MOON_COLOR = (0.78, 0.84, 0.95)
 THIN_CLOUD_DIM = 0.8         # 薄い巻雲の下で街明かりを減らす割合
-LIGHTS_BLOCK = (0.25, 0.8)   # 雲の判定値がこの範囲で、街明かりが「見える」→「まったく見えない」へ移る（厚い雲の下は真っ暗）
+# 雲の下の街明かり。NOAA-20 VIIRS 夜間画像（Day/Night Band）と5晩比べて決めた（2026-11-01〜07、日本付近）:
+#   赤外で雲と判定される所でも、街明かりはたいてい見えている（ぼやけて広がる）。暗くなるのは最も厚い雲の下だけ。
+LIGHTS_THICK = (0.8, 1.0, 0.6)    # 雲の判定値 0.8→1.0 で、明かりを最大 60% 減らす
+LIGHTS_DIFFUSE = (0.55, 0.95)     # 雲の判定値 0.55→0.95 で、明かりを「点」から「雲ににじんだ光」へ移す
+LIGHTS_DIFFUSE_KM = 4.0           # にじみの広がり（ガウスの幅, km）
 # くっきり処理（センサーのぼけを戻すアンシャープ）。データにない模様は足さない: 結果を周囲3x3の明るさの範囲に収める
 SHARPEN = {0.5: (1.2, 1.0), 1.0: (1.0, 0.6)}   # 格子km: (ぼけの幅[画素], 強さ)
 
@@ -353,11 +357,15 @@ def add_night(arr, bts, area, t_obs, cell, res_km, split_lights=False, rows=400)
     sharp = np.clip((lmap - LIGHTS_HALO_CUT * halo) / (1 - LIGHTS_HALO_CUT), 0, 255)
     v = np.clip((sharp - LIGHTS_FLOOR) / (255.0 - LIGHTS_FLOOR), 0, 1)
     li = LIGHTS_GAIN * v ** LIGHTS_GAMMA
-    # 雲: 厚い雲・低い雲の下は見えない。薄い巻雲の下もかなり暗くなる（にじませない）
-    glow = np.zeros_like(li)
-    b0, b1 = LIGHTS_BLOCK
-    bk = np.clip((block - b0) / (b1 - b0), 0, 1)
-    li = li * (1 - bk * bk * (3 - 2 * bk))
+    # 雲: 雲越しの明かりはぼやけて広がる（雲に散らされる）。最も厚い雲の下だけ暗くなる
+    def sstep(x, a, b):
+        t = np.clip((x - a) / (b - a), 0, 1)
+        return t * t * (3 - 2 * t)
+    t0_, t1_, tmax = LIGHTS_THICK
+    li = li * (1 - tmax * sstep(block, t0_, t1_))
+    dfz = sstep(block, *LIGHTS_DIFFUSE)
+    glow = ndimage.gaussian_filter(li * dfz, sigma=max(1.0, LIGHTS_DIFFUSE_KM / res_km))
+    li = li * (1 - dfz)
     del lmap, halo, sharp
     # 3) 色: 明るい中心ほど白（LED）、暗いほどオレンジ（ナトリウム灯）
     k = np.clip((v - 0.25) / 0.6, 0, 1)[..., None]
