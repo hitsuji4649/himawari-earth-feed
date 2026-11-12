@@ -50,6 +50,7 @@ HI = 4032           # 高解像度キャンバス（2016px×2 に分け、各タ
 PAD = 16            # タイルの継ぎ目対策の重なり幅
 # 真下まわりの詳細（1km格子）: 走査角で ±DETAIL_FRAC×(地球の縁) の正方形。高度400kmで見える範囲をおおう
 DETAIL_FRAC = 0.40
+LEGACY_PATHS = True     # 古い版のワールド用に hi/HHMM_k.jpg の置き場も作る（全員が新しい版になったら False）
 DETAIL_BOX = (-DETAIL_FRAC, -DETAIL_FRAC, DETAIL_FRAC, DETAIL_FRAC)   # 地球の縁の走査角を1とした (x0, y0, x1, y1)
 # 日本まわり（0.5km格子）: 走査角[rad]の長方形 (x0, y0, x1, y1)。与那国島〜宗谷岬・知床をおおう
 JAPAN_BOX = (-0.050, 0.066, 0.012, 0.122)
@@ -637,16 +638,31 @@ def main():
         prev_hi = datetime.strptime(prev_head[1], "%Y-%m-%dT%H:%MZ").replace(tzinfo=timezone.utc)
         prev_flags = prev_head[4]
 
-    slot_name = lambda layer, k, t: f"{layer}/{t:%H%M}_{k}.jpg"
+    # 最新の画像は日付（UTC）の偶数・奇数で置き場を分ける（hi0/HHMM_k.jpg など）。
+    # 名前が時刻だけだと前日の同じ時刻と同じURLになり、配信網に残った前日の画像が混ざることがあるため。
+    # 古い版のワールド用に、これまでの置き場（hi/HHMM_k.jpg）にも同じものを置く（上げ直しが済んだら LEGACY_PATHS を False に）
+    slot_name = lambda layer, k, t: f"{layer}{t.day % 2}/{t:%H%M}_{k}.jpg"
+    legacy_name = lambda layer, k, t: f"{layer}/{t:%H%M}_{k}.jpg"
+
+    def put_latest(raw_or_src, layer, k, t):
+        for nm in ([slot_name(layer, k, t)] + ([legacy_name(layer, k, t)] if LEGACY_PATHS else [])):
+            d = out / nm
+            d.parent.mkdir(parents=True, exist_ok=True)
+            if isinstance(raw_or_src, Path):
+                shutil.copyfile(raw_or_src, d)
+            else:
+                d.write_bytes(raw_or_src)
 
     def carry_latest(t, flags, layers=("hi", "dt", "jp", "jl")):
         got = ""
         for layer, f in LAYERS:
             if layer in layers and (f is None or f in flags):
-                (out / layer).mkdir(parents=True, exist_ok=True)
                 for k in range(4):
-                    raw, _ = http(site + slot_name(layer, k, t))
-                    (out / slot_name(layer, k, t)).write_bytes(raw)
+                    try:
+                        raw, _ = http(site + slot_name(layer, k, t))
+                    except Exception:
+                        raw, _ = http(site + legacy_name(layer, k, t))   # 切り替え直後は古い置き場にしかない
+                    put_latest(raw, layer, k, t)
                 got += f or ""
         return got
 
@@ -673,7 +689,10 @@ def main():
         try:
             flags = make_set(keys, newest, tmp / "latest")
             fresh = tmp / "latest"
-            copy_set(fresh, lambda l, k: f"{l}_{k}.jpg", out, lambda l, k: slot_name(l, k, newest), flags)
+            for layer, f in LAYERS:
+                if f is None or f in flags:
+                    for k in range(4):
+                        put_latest(fresh / f"{layer}_{k}.jpg", layer, k, newest)
             hi_obs = newest
         except Exception as e:
             log("最新の作成に失敗:", e)
