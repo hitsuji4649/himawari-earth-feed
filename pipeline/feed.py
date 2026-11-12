@@ -50,7 +50,7 @@ HI = 4032           # 高解像度キャンバス（2016px×2 に分け、各タ
 PAD = 16            # タイルの継ぎ目対策の重なり幅
 # 真下まわりの詳細（1km格子）: 走査角で ±DETAIL_FRAC×(地球の縁) の正方形。高度400kmで見える範囲をおおう
 DETAIL_FRAC = 0.40
-LEGACY_PATHS = True     # 古い版のワールド用に hi/HHMM_k.jpg の置き場も作る（全員が新しい版になったら False）
+LEGACY_PATHS = False    # 古い版のワールド用に hi/HHMM_k.jpg の置き場も作る（2026-11-12 上げ直し済みのため止めた）
 DETAIL_BOX = (-DETAIL_FRAC, -DETAIL_FRAC, DETAIL_FRAC, DETAIL_FRAC)   # 地球の縁の走査角を1とした (x0, y0, x1, y1)
 # 日本まわり（0.5km格子）: 走査角[rad]の長方形 (x0, y0, x1, y1)。与那国島〜宗谷岬・知床をおおう
 JAPAN_BOX = (-0.050, 0.066, 0.012, 0.122)
